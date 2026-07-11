@@ -3,7 +3,28 @@
 Installation guide for the pipeline described in [PROJECT.md](PROJECT.md):
 push-to-talk → faster-whisper (GPU) → local LLM (Ollama) → tool execution.
 
-Target machine: local Ubuntu desktop, NVIDIA GPU (RTX 4080 Laptop, 12 GB VRAM),
+## GPU compatibility — read before installing
+
+> **This guide was written and verified on an NVIDIA RTX 4080 Laptop GPU
+> (12 GB VRAM, Ada Lovelace architecture, driver 595.71, CUDA 12 wheels).**
+> All package choices below (`nvidia-cublas-cu12`, `nvidia-cudnn-cu12`,
+> Whisper/LLM model sizes) are tied to this card.
+>
+> **If the GPU is switched — e.g. the planned RTX 5090 migration — this file
+> must be revisited:**
+>
+> - **RTX 5090 (Blackwell, sm_120)** requires CUDA 12.8+ kernel support.
+>   Upgrade `ctranslate2`, `faster-whisper`, the `nvidia-*-cu12` wheels, and
+>   Ollama to their latest versions, and make sure the NVIDIA driver is 570+.
+> - **Model sizes should be scaled up** with 32 GB VRAM: Whisper `large-v3`
+>   instead of `small.en`, and a 14–32B LLM instead of `qwen3:8b`
+>   (see the VRAM notes in [PROJECT.md](PROJECT.md)).
+> - **Re-run all smoke tests in Step 6** after the swap before trusting the
+>   pipeline.
+>
+> After a successful migration, update this section with the new card's data.
+
+Target machine: local Ubuntu desktop with the GPU described above,
 NVIDIA driver installed (verify with `nvidia-smi`).
 
 ## Step 1: System dependencies
