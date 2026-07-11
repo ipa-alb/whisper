@@ -72,12 +72,22 @@ Each stage can be verified independently before wiring them together.
 
 **GPU + Whisper:**
 
+The cuBLAS/cuDNN libraries installed via pip are not on the system loader path,
+so they must be preloaded before faster-whisper initializes CUDA (the pipeline
+code does this at startup too):
+
 ```bash
-python3 -c "
+python3 - <<'EOF'
+import os, glob, ctypes
+for d in glob.glob(".venv/lib/python3*/site-packages/nvidia/*/lib"):
+    for so in glob.glob(os.path.join(d, "*.so*")):
+        try: ctypes.CDLL(so)
+        except OSError: pass
+
 from faster_whisper import WhisperModel
-m = WhisperModel('small.en', device='cuda', compute_type='float16')
-print('Whisper model loaded on GPU OK')
-"
+m = WhisperModel("small.en", device="cuda", compute_type="float16")
+print("Whisper model loaded on GPU OK")
+EOF
 ```
 
 **Microphone:**
