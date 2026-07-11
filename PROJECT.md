@@ -52,13 +52,14 @@ VRAM budget on the 4080 (12 GB): Whisper small ≈ 1 GB + 8B LLM quantized ≈ 5
 
 ## Roadmap
 
-- [ ] **Phase 1 — Transcription PoC:** mic capture + push-to-talk hotkey +
-      faster-whisper → print transcript to terminal.
-- [ ] **Phase 2 — LLM loop:** install Ollama, pull a model, send transcript,
-      print response. Plain chat, no tools yet.
-- [ ] **Phase 3 — Tool execution:** define `tools/` scripts with self-describing
-      schemas, wire up Ollama tool calling, add the confirm-before-run path for
-      generated code.
+- [x] **Phase 1 — Transcription PoC:** mic capture + faster-whisper → print
+      transcript to terminal (`listen.py`; hotkey replaced by record-on-launch,
+      Enter ends the utterance).
+- [x] **Phase 2 — LLM loop:** Ollama + `qwen3:8b`, transcript → response
+      (`assistant.py`).
+- [x] **Phase 3 — Tool execution:** `tools/` scripts with self-describing
+      schemas (list_files, read_file, write_note), Ollama tool calling, and the
+      confirm-before-run path for generated code (run_python).
 - [ ] **Phase 4 — Workspace instructions:** `.md` instruction file describing the
       available tools and conventions (deferred until tools exist).
 - [ ] **Later:** MCP server exposure, TTS responses, wake word, 5090 migration

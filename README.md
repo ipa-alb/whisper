@@ -19,25 +19,28 @@ Push-to-talk → faster-whisper (GPU) → local LLM (Ollama) → Python tool exe
 Proof-of-concept phase. Current roadmap position: **Phase 1 — Transcription PoC**
 (see [PROJECT.md](PROJECT.md#roadmap)).
 
-Environment fully installed and smoke-tested on 2026-07-11: Whisper `small.en`
-loads on the GPU and transcribes, the microphone is reachable via PipeWire, and
-Ollama answers with `qwen3:8b`. What's missing for Phase 1 is the push-to-talk
-script itself.
+Environment fully installed and smoke-tested on 2026-07-11 (RTX 4080 Laptop).
 
 | Phase | Goal | Status |
 | ----- | ---- | ------ |
-| 1 | Push-to-talk → transcript in terminal | environment ✅ verified, script pending |
-| 2 | Transcript → local LLM chat loop | pending |
-| 3 | LLM tool calling + confirm-before-run for generated code | pending |
+| 1 | Record → transcript in terminal (`listen.py`) | ✅ done, verified by voice |
+| 2 | Transcript → local LLM chat loop (`assistant.py`) | ✅ done |
+| 3 | LLM tool calling + confirm-before-run for generated code | ✅ first version (4 tools) |
 | 4 | Workspace instructions file for the toolset | pending |
 
 ## Quick start
 
 ```bash
 source .venv/bin/activate
-# (once Phase 1 lands:)
-python3 listen.py
+python3 assistant.py                 # full pipeline: voice → LLM → tools
+python3 assistant.py --text "..."    # same pipeline with typed input (testing)
+python3 listen.py                    # transcription only (Phase 1)
 ```
+
+Recording starts on launch; speak, press Enter, and the transcript goes to the
+LLM. Ask it to *do* something ("list the files", "write down a note that...")
+and it calls the matching tool from [tools/](tools/); anything it wants to run
+as ad-hoc Python is shown to you first and needs a `y` to execute.
 
 See [INSTALL.md](INSTALL.md) if the environment isn't set up yet.
 
