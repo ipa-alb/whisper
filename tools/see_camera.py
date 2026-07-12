@@ -17,6 +17,7 @@ Model: models/yolov8n.onnx (stock COCO, 80 classes).
 import glob
 import os
 import subprocess
+import tempfile
 
 import numpy as np
 
@@ -168,8 +169,49 @@ def _capture_ffmpeg():
     return _blob(frame), None
 
 
+def _capture_g1():
+    """Capture RGBD on the G1 robot's Orin over ssh; infer here.
+
+    The RealSense is on the robot's Orin, not this PC, so we run the deployed
+    grabber there (python3.8 + pyrealsense2), pull back one compressed npz, and
+    letterbox it exactly like _capture_realsense — the (blob, depth_lb) contract
+    and downstream detection are identical. Configure via env:
+      G1_ORIN            ssh target (default unitree@192.168.0.87)
+      G1_CAPTURE_SCRIPT  remote grabber path (default /home/unitree/g1_capture_rgbd.py)
+    """
+    orin = os.environ.get("G1_ORIN", "unitree@192.168.0.87")
+    remote_script = os.environ.get("G1_CAPTURE_SCRIPT", "/home/unitree/g1_capture_rgbd.py")
+    remote_npz = "/tmp/g1_snap.npz"
+
+    grab = subprocess.run(
+        ["ssh", orin, "python3", remote_script, remote_npz],
+        capture_output=True, text=True, timeout=45,
+    )
+    if grab.returncode != 0:
+        raise RuntimeError(f"orin capture failed: {(grab.stderr or grab.stdout).strip()[:300]}")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        local_npz = os.path.join(tmp, "snap.npz")
+        pull = subprocess.run(
+            ["scp", "-q", f"{orin}:{remote_npz}", local_npz],
+            capture_output=True, text=True, timeout=30,
+        )
+        if pull.returncode != 0:
+            raise RuntimeError(f"scp of snapshot failed: {pull.stderr.strip()[:300]}")
+        data = np.load(local_npz)
+        rgb, depth_m = data["color"], data["depth"]
+
+    return _blob(_letterbox(rgb, 114)), _letterbox(depth_m, 0.0)
+
+
 def _capture():
-    """Prefer RealSense (gives depth); fall back to ffmpeg colour-only."""
+    """Prefer RealSense (gives depth); fall back to ffmpeg colour-only.
+
+    SEE_CAMERA_SOURCE=g1 captures from the G1 robot's Orin over ssh instead of a
+    camera attached to this machine.
+    """
+    if os.environ.get("SEE_CAMERA_SOURCE") == "g1":
+        return _capture_g1()
     try:
         return _capture_realsense()
     except Exception:
