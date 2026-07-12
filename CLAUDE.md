@@ -16,15 +16,23 @@ source .venv/bin/activate            # always work inside the venv
 python3 assistant.py                 # full pipeline: voice → LLM → tools
 python3 assistant.py --text "..."    # same pipeline, typed input — use this to test without mic/GPU-whisper
 python3 listen.py                    # Phase 1: transcription only
+python3 mic_check.py                 # diagnostic: live level meter for all input devices
 ```
 
-There is no test suite, linter, or build step. Verification is manual: `--text` mode exercises the LLM + tool layer without audio; the smoke tests in INSTALL.md Step 6 verify GPU/Whisper, microphone, and Ollama independently. Ollama must be running (`localhost:11434`) with `qwen3:30b` pulled.
+There is no test suite, linter, or build step. Verification is manual: `--text` mode exercises the LLM + tool layer without audio; the smoke tests in INSTALL.md Step 6 verify GPU/Whisper, microphone, and Ollama independently. Ollama must be running (`localhost:11434`) with `qwen3:30b` pulled. On the current machine Ollama is a user-space tarball install with no systemd service — if `localhost:11434` doesn't answer, start it with `~/.local/bin/ollama serve &`.
+
+Audio comes from the system **default** input source. If transcription returns "(nothing recognized)" while someone is speaking, suspect the default source before suspecting Whisper — `mic_check.py` shows which device actually hears the voice.
 
 ## Architecture
 
 - **[listen.py](listen.py)** — Phase 1 PoC, standalone transcription loop. Recording starts on launch; Enter ends an utterance (this replaced the original hotkey design).
 - **[assistant.py](assistant.py)** — the main pipeline. Loads all tools, runs the record → transcribe → `ollama.chat` loop. Tool calls are executed in rounds (max `MAX_TOOL_ROUNDS`) until the LLM returns plain text. Tool exceptions are caught and returned to the LLM as `error: ...` strings — tool bugs must never kill the session.
 - **[tools/](tools/)** — plugin directory, auto-discovered at startup.
+- **[mic_check.py](mic_check.py)** — standalone diagnostic, not part of the pipeline.
+
+### LLM output quirk
+
+`qwen3:30b` sometimes emits its chain-of-thought inline despite `think=False`; `handle_utterance` in assistant.py strips everything up to a leaked `</think>` tag before returning the reply. Keep that strip when changing models — it's a no-op for models that behave.
 
 ### Tool plugin convention
 

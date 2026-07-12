@@ -1,11 +1,11 @@
 # Whisper Voice Pipeline
 
-A voice-controlled local AI assistant: hold a hotkey, speak a command, and a
+A voice-controlled local AI assistant: speak a command, press Enter, and a
 local LLM executes Python scripts in this workspace. Everything runs on-device —
 no cloud, no network exposure.
 
 ```
-Push-to-talk → faster-whisper (GPU) → local LLM (Ollama) → Python tool execution
+Speak (Enter to send) → faster-whisper (GPU) → local LLM (Ollama) → Python tool execution
 ```
 
 ## Documentation
@@ -16,8 +16,8 @@ Push-to-talk → faster-whisper (GPU) → local LLM (Ollama) → Python tool exe
 
 ## Status
 
-Proof-of-concept phase. Current roadmap position: **Phase 1 — Transcription PoC**
-(see [PROJECT.md](PROJECT.md#roadmap)).
+Proof-of-concept phase. Phases 1–3 are done; next up is **Phase 4 — workspace
+instructions file** (see [PROJECT.md](PROJECT.md#roadmap)).
 
 Migrated to the RTX 5090 (Dell Pro Max Tower) on 2026-07-11 and verified by
 voice end-to-end on 2026-07-12 (see the GPU compatibility section in
@@ -37,7 +37,12 @@ source .venv/bin/activate
 python3 assistant.py                 # full pipeline: voice → LLM → tools
 python3 assistant.py --text "..."    # same pipeline with typed input (testing)
 python3 listen.py                    # transcription only (Phase 1)
+python3 mic_check.py                 # live level meter — find the right mic
 ```
+
+Ollama must be serving on `localhost:11434`. If it was installed from the
+release tarball instead of the install script (no systemd service), start it
+manually after a reboot: `~/.local/bin/ollama serve &`.
 
 Recording starts on launch; speak, press Enter, and the transcript goes to the
 LLM. Ask it to *do* something ("list the files", "write down a note that...")
@@ -45,6 +50,11 @@ and it calls the matching tool from [tools/](tools/); anything it wants to run
 as ad-hoc Python is shown to you first and needs a `y` to execute.
 
 See [INSTALL.md](INSTALL.md) if the environment isn't set up yet.
+
+If speech keeps coming back as "(nothing recognized)", run `mic_check.py` and
+speak — whichever bar moves is the live microphone. The pipeline records from
+the system **default** source, so switch it to that device (sound settings or
+`pactl set-default-source ...`).
 
 ## Hardware
 
