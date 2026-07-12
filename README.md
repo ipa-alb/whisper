@@ -19,7 +19,9 @@ Push-to-talk → faster-whisper (GPU) → local LLM (Ollama) → Python tool exe
 Proof-of-concept phase. Current roadmap position: **Phase 1 — Transcription PoC**
 (see [PROJECT.md](PROJECT.md#roadmap)).
 
-Environment fully installed and smoke-tested on 2026-07-11 (RTX 4080 Laptop).
+Migrated to the RTX 5090 (Dell Pro Max Tower) on 2026-07-11 and verified by
+voice end-to-end on 2026-07-12 (see the GPU compatibility section in
+[INSTALL.md](INSTALL.md)).
 
 | Phase | Goal | Status |
 | ----- | ---- | ------ |
@@ -46,11 +48,11 @@ See [INSTALL.md](INSTALL.md) if the environment isn't set up yet.
 
 ## Hardware
 
-Developed and verified on an **RTX 4080 Laptop GPU (12 GB VRAM)**. A migration
-to an RTX 5090 is planned — the pipeline design stays the same, but the CUDA
-packages and model sizes must be updated; see the
-**GPU compatibility** section at the top of [INSTALL.md](INSTALL.md) before
-switching cards.
+Runs on an **RTX 5090 (32 GB VRAM)** with Whisper `large-v3` and `qwen3:30b`.
+Originally developed on an RTX 4080 Laptop (12 GB) with `small.en` + `qwen3:8b`;
+the pipeline design is unchanged across cards — only CUDA packages and model
+sizes differ. See the **GPU compatibility** section at the top of
+[INSTALL.md](INSTALL.md) before switching cards.
 
 ## Principles
 

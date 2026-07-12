@@ -5,8 +5,9 @@ them to a local LLM, which can execute Python scripts in a workspace.
 
 ## Scope (agreed 2026-07-11)
 
-- **Runs entirely on the local machine** — currently RTX 4080 Laptop (12 GB VRAM),
-  planned migration to RTX 5090. Proof of concept first, optimize later.
+- **Runs entirely on the local machine** — currently RTX 5090 (32 GB VRAM);
+  developed on an RTX 4080 Laptop (12 GB), migrated 2026-07-11. Proof of
+  concept first, optimize later.
 - **Interaction:** push-to-talk via global hotkey (X11). Press → speak → release →
   transcript goes to the LLM.
 - **Language:** mostly English (Whisper pinned to `language=en` for speed/accuracy).
@@ -41,14 +42,15 @@ them to a local LLM, which can execute Python scripts in a workspace.
 | Component      | Choice           | Why                                                            |
 | -------------- | ---------------- | -------------------------------------------------------------- |
 | Transcription  | faster-whisper   | ~4x faster than openai/whisper, far less VRAM, streaming-ready |
-| Whisper model  | `small.en` or `distil-small.en` to start | Fast, accurate enough for commands; easy to bump up |
+| Whisper model  | `large-v3` on the 5090 (was `small.en` on the 4080) | Best accuracy; still fast on 32 GB-class hardware |
 | LLM runtime    | Ollama           | Simplest local serving, native tool-calling API, model swap is one command |
-| LLM model      | 8B-class (e.g. Qwen3 8B) | Fits in ~5-6 GB quantized alongside Whisper on 12 GB; revisit on 5090 |
+| LLM model      | `qwen3:30b` (MoE, 3B active) on the 5090 (was `qwen3:8b`) | Near-32B quality at small-model latency — voice needs fast responses |
 | Audio capture  | sounddevice      | Simple PortAudio bindings, already in the original plan        |
 | Hotkey         | pynput (X11)     | Global hotkey listener without desktop-environment plugins     |
 
-VRAM budget on the 4080 (12 GB): Whisper small ≈ 1 GB + 8B LLM quantized ≈ 5-6 GB
-→ comfortable headroom. On the 5090 both can scale up (large-v3 + 14-32B model).
+VRAM budget on the 5090 (32 GB): Whisper large-v3 ≈ 3 GB + qwen3:30b quantized
+≈ 19 GB → comfortable headroom. (On the 4080 it was small.en ≈ 1 GB + qwen3:8b
+≈ 5-6 GB on 12 GB.)
 
 ## Roadmap
 
@@ -62,8 +64,9 @@ VRAM budget on the 4080 (12 GB): Whisper small ≈ 1 GB + 8B LLM quantized ≈ 5
       confirm-before-run path for generated code (run_python).
 - [ ] **Phase 4 — Workspace instructions:** `.md` instruction file describing the
       available tools and conventions (deferred until tools exist).
-- [ ] **Later:** MCP server exposure, TTS responses, wake word, 5090 migration
-      (bigger models, config change only).
+- [x] **5090 migration (2026-07-11):** environment rebuilt on the RTX 5090,
+      models bumped to `large-v3` + `qwen3:30b` — config change only, as planned.
+- [ ] **Later:** MCP server exposure, TTS responses, wake word.
 
 ## Files
 
