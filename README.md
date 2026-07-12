@@ -28,6 +28,7 @@ voice end-to-end on 2026-07-12 (see the GPU compatibility section in
 | 1 | Record → transcript in terminal (`listen.py`) | ✅ done, verified by voice |
 | 2 | Transcript → local LLM chat loop (`assistant.py`) | ✅ done |
 | 3 | LLM tool calling + confirm-before-run for generated code | ✅ first version (4 tools) |
+| — | Vision tool: camera snapshot → YOLO detection + depth distance (`look`) | ✅ done, verified (person/bottle/chair + metres) |
 | 4 | Workspace instructions file for the toolset | pending |
 
 ## Quick start
@@ -45,9 +46,17 @@ release tarball instead of the install script (no systemd service), start it
 manually after a reboot: `~/.local/bin/ollama serve &`.
 
 Recording starts on launch; speak, press Enter, and the transcript goes to the
-LLM. Ask it to *do* something ("list the files", "write down a note that...")
-and it calls the matching tool from [tools/](tools/); anything it wants to run
-as ad-hoc Python is shown to you first and needs a `y` to execute.
+LLM. Ask it to *do* something ("list the files", "write down a note that...",
+"look at the camera — is there a person?") and it calls the matching tool from
+[tools/](tools/); anything it wants to run as ad-hoc Python is shown to you
+first and needs a `y` to execute.
+
+The `look` tool takes one camera snapshot and runs a lightweight YOLO
+(`yolov8n.onnx` on onnxruntime/CPU — no PyTorch) to report what it sees. On the
+Intel RealSense D455 it also reports **how far away** each object is, by reading
+the depth stream aligned to the colour lens (e.g. *"person, center, 0.8 m"*). It
+needs `models/yolov8n.onnx`; see the vision section in [INSTALL.md](INSTALL.md)
+to create it.
 
 See [INSTALL.md](INSTALL.md) if the environment isn't set up yet.
 

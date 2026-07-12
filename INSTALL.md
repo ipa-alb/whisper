@@ -96,6 +96,42 @@ Model note: `qwen3:30b` quantized (~19 GB VRAM) fits comfortably next to
 Whisper `large-v3` (~3 GB) on 32 GB. Swapping models is a single `ollama pull`
 plus updating `LLM_MODEL` in `assistant.py` — no pipeline changes.
 
+## Step 5b: Vision tool (camera object detection)
+
+The `look` tool (`tools/see_camera.py`) grabs one webcam frame and runs a stock
+YOLOv8-nano model. It is deliberately **lightweight**: at runtime it needs only
+`onnxruntime` + `numpy` (both already installed) and the `ffmpeg`/`v4l2-ctl` CLI
+tools — **no PyTorch, no OpenCV, no ultralytics.**
+
+```bash
+pip install onnxruntime          # CPU inference; one snapshot is fast enough
+pip install pyrealsense2         # depth/distance on the Intel RealSense D455 (optional)
+sudo apt install -y v4l-utils    # provides v4l2-ctl (camera auto-detect)
+```
+
+`pyrealsense2` is optional: with it, the tool grabs colour + depth aligned to the
+colour lens and reports each object's distance in metres. Without it (or without
+a RealSense), the tool falls back to an ffmpeg colour-only capture — same
+detection, no distance.
+
+The model file `models/yolov8n.onnx` is **not committed** (git-ignored). Create it
+once by exporting stock `yolov8n.pt` — do this in a *throwaway* venv so PyTorch
+never lands in the project venv:
+
+```bash
+python3 -m venv /tmp/yolo-export && /tmp/yolo-export/bin/pip install ultralytics
+cd ~/workspaces/whisper && mkdir -p models
+/tmp/yolo-export/bin/yolo export model=yolov8n.pt format=onnx imgsz=640
+mv yolov8n.onnx models/
+rm -rf /tmp/yolo-export           # project venv stays torch-free
+```
+
+Camera note: on a RealSense-style multi-stream camera, `/dev/video0` is the
+**depth** stream (`Z16`) — the RGB camera is a different node (`/dev/video4`,
+`YUYV`, on this machine). The tool auto-detects the first node with a colour
+format; override with `SEE_CAMERA_DEVICE=/dev/videoN` if it picks wrong.
+`v4l2-ctl --list-formats /dev/videoN` shows each node's formats.
+
 ## Step 6: Smoke tests
 
 Each stage can be verified independently before wiring them together.
@@ -133,6 +169,14 @@ print(sd.query_devices())
 
 ```bash
 ollama run qwen3:30b "Say hello in one sentence."
+```
+
+**Vision (camera + YOLO):**
+
+```bash
+python3 -c "from tools.see_camera import run; print(run())"
+# → Camera snapshot (N detected): person (0.84, center, 0.8 m), bottle (0.86, left, 0.3 m), ...
+# (distances appear only when pyrealsense2 + a RealSense are present)
 ```
 
 ## Principles (from the scope discussion)

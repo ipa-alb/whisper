@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A voice-controlled local AI assistant: record speech → transcribe with faster-whisper (GPU) → send to a local LLM (Ollama, `qwen3:30b`) → the LLM answers or calls Python tools. Everything runs on-device; nothing binds to a public interface, and audio/prompts never leave the machine.
+A voice-controlled local AI assistant: record speech → transcribe with faster-whisper (GPU) → send to a local LLM (Ollama, `qwen3:30b`) → the LLM answers or calls Python tools. One of those tools (`look`) takes a camera snapshot and runs YOLO object detection, so the assistant can be asked what it sees. Everything runs on-device; nothing binds to a public interface, and audio/prompts/images never leave the machine.
 
 **[PROJECT.md](PROJECT.md) is the source of truth** for scope, component choices, and roadmap. [INSTALL.md](INSTALL.md) covers environment setup and per-stage smoke tests. Keep both (and the README status table) in sync when phases advance or components change.
 
@@ -50,6 +50,15 @@ Conventions the existing tools follow, keep them for new ones:
 ### CUDA preload quirk
 
 `listen.py` and `assistant.py` begin by `ctypes.CDLL`-loading every `nvidia/*/lib/*.so*` from the venv's site-packages **before** importing faster-whisper — the pip-installed cuBLAS/cuDNN libs aren't on the system loader path. Any new entry point that uses Whisper on GPU needs the same preload block.
+
+### Camera / vision tool (`tools/see_camera.py` → `look`)
+
+Deliberately dependency-light so it stays "lightweight YOLO": **no OpenCV, no PyTorch, no ultralytics at runtime.** `models/yolov8n.onnx` (stock COCO, 80 classes) runs under `onnxruntime` on **CPU** (one snapshot is fast enough there — the GPU stays reserved for Whisper/LLM); NMS and box-decode are plain numpy in the tool. Detections come back as `name (conf, left|center|right[, distance m])`.
+
+- **Depth / distance:** the camera is an **Intel RealSense D455** (`8086:0b5c`). `_capture_realsense()` (pyrealsense2) grabs colour + depth *aligned to the colour lens* via `rs.align`, so distance is read straight from the depth map at each YOLO box centre (median of a small patch, ignoring zero/invalid pixels; depth scale ≈ 1 mm/unit). This is the whole reason detection runs on the colour node — depth and colour are two physically-offset lenses, and alignment is what makes "read depth at the box centre" correct.
+- **Fallback:** if pyrealsense2/the RealSense isn't usable, `_capture_ffmpeg()` grabs a plain colour frame instead — same detection, **no distance**. Node layout: `/dev/video0` is the `Z16` depth stream, the RGB node is `/dev/video4` (`YUYV`); `_detect_camera()` auto-picks the first colour node (`MJPG`/`YUYV`), skipping depth/IR. Override with `SEE_CAMERA_DEVICE=/dev/videoN`.
+- **Model:** `models/yolov8n.onnx` is git-ignored (not committed). It was produced once by exporting stock `yolov8n.pt` with `ultralytics` in a throwaway venv — the project venv never gets torch. To regenerate it, see the vision section in INSTALL.md.
+- Runs entirely on CPU, so — unlike the Whisper entry points — it needs **no** CUDA preload block.
 
 ### GPU compatibility
 

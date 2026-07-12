@@ -47,6 +47,8 @@ them to a local LLM, which can execute Python scripts in a workspace.
 | LLM model      | `qwen3:30b` (MoE, 3B active) on the 5090 (was `qwen3:8b`) | Near-32B quality at small-model latency — voice needs fast responses |
 | Audio capture  | sounddevice      | Simple PortAudio bindings, already in the original plan        |
 | Hotkey         | pynput (X11)     | Global hotkey listener without desktop-environment plugins     |
+| Object detection | `yolov8n.onnx` via onnxruntime (CPU) | Lightweight "what do you see" tool; no PyTorch/OpenCV at runtime — onnxruntime does inference |
+| Depth / distance | Intel RealSense D455 + pyrealsense2 | Depth aligned to colour lens → per-object distance in metres; falls back to ffmpeg colour-only if absent |
 
 VRAM budget on the 5090 (32 GB): Whisper large-v3 ≈ 3 GB + qwen3:30b quantized
 ≈ 19 GB → comfortable headroom. (On the 4080 it was small.en ≈ 1 GB + qwen3:8b
@@ -62,6 +64,12 @@ VRAM budget on the 5090 (32 GB): Whisper large-v3 ≈ 3 GB + qwen3:30b quantized
 - [x] **Phase 3 — Tool execution:** `tools/` scripts with self-describing
       schemas (list_files, read_file, write_note), Ollama tool calling, and the
       confirm-before-run path for generated code (run_python).
+- [x] **Vision tool (`look`):** single-snapshot YOLO object detection
+      (`tools/see_camera.py`, `yolov8n.onnx` on onnxruntime/CPU) with **per-object
+      distance** from the RealSense D455 depth stream (aligned to the colour lens).
+      The user can ask "what do you see?", "is there a person?", or "how far away
+      is it?" and the LLM calls it. Verified end-to-end: person/bottle/chair
+      detected with correct positions and plausible distances (~0.3–0.8 m).
 - [ ] **Phase 4 — Workspace instructions:** `.md` instruction file describing the
       available tools and conventions (deferred until tools exist).
 - [x] **5090 migration (2026-07-11):** environment rebuilt on the RTX 5090,
