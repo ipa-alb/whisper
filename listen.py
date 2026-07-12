@@ -27,7 +27,7 @@ import numpy as np
 import sounddevice as sd
 
 SAMPLE_RATE = 16000  # what Whisper expects
-MODEL_NAME = "small.en"
+MODEL_NAME = "large-v3"
 
 frames: list[np.ndarray] = []
 frames_lock = threading.Lock()

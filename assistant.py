@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Phases 2+3 — voice assistant pipeline.
 
-speech → faster-whisper (GPU) → qwen3:8b (Ollama) → tool execution
+speech → faster-whisper (GPU) → qwen3:30b (Ollama) → tool execution
 
 Recording starts on launch. Press Enter to stop the current utterance; the
 transcript goes to the LLM, which either answers in text or calls tools from
@@ -33,8 +33,8 @@ for _d in glob.glob(os.path.join(sys.prefix, "lib", "python3*", "site-packages",
 import ollama
 
 SAMPLE_RATE = 16000
-WHISPER_MODEL = "small.en"
-LLM_MODEL = "qwen3:8b"
+WHISPER_MODEL = "large-v3"
+LLM_MODEL = "qwen3:30b"
 MAX_TOOL_ROUNDS = 5
 WORKSPACE = os.path.dirname(os.path.abspath(__file__))
 TOOLS_DIR = os.path.join(WORKSPACE, "tools")
@@ -71,7 +71,12 @@ def handle_utterance(text, messages, registry, schemas):
         msg = response.message
         messages.append(msg)
         if not msg.tool_calls:
-            return (msg.content or "").strip()
+            content = (msg.content or "").strip()
+            # qwen3:30b sometimes emits its reasoning inline despite think=False;
+            # keep only what follows the closing tag.
+            if "</think>" in content:
+                content = content.rsplit("</think>", 1)[1].strip()
+            return content
         for call in msg.tool_calls:
             name = call.function.name
             args = dict(call.function.arguments or {})

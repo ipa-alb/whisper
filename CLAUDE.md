@@ -2,31 +2,16 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Project Overview
+## What this is
 
-A voice-controlled **local** AI assistant: record voice → transcribe on the GPU
-with faster-whisper → send the text to a local LLM (Ollama / `qwen3:8b`) → the
-LLM executes Python tools in this workspace. Everything runs on-device; nothing
-binds to a network interface and audio never leaves the machine.
+A voice-controlled local AI assistant: record speech → transcribe with faster-whisper (GPU) → send to a local LLM (Ollama, `qwen3:30b`) → the LLM answers or calls Python tools. One of those tools (`look`) takes a camera snapshot and runs YOLO object detection, so the assistant can be asked what it sees. Everything runs on-device; nothing binds to a public interface, and audio/prompts/images never leave the machine.
 
 This directory is its **own git repository**, independent of the parent
 `unitree_g1_ros2_driver_wireless` ROS2 workspace it sits inside — it is not a
 ROS2 package and shares nothing with the G1 driver code. Treat it as a
 standalone Python proof-of-concept.
 
-`PROJECT.md` is the source of truth for scope, component choices, and the phased
-roadmap. `INSTALL.md` is the setup guide with per-stage smoke tests. Read
-`PROJECT.md` before making design decisions.
-
-## Pipeline
-
-```
-record-on-launch → faster-whisper (GPU, en) → qwen3:8b via Ollama → tools/*.py
-```
-
-`assistant.py` is the full pipeline; `listen.py` is the Phase-1 transcription-only
-PoC (mic → transcript, no LLM). Recording begins at launch — speak, press
-**Enter** to end the utterance and send it, `Ctrl+C` to quit.
+**[PROJECT.md](PROJECT.md) is the source of truth** for scope, component choices, and roadmap. [INSTALL.md](INSTALL.md) covers environment setup and per-stage smoke tests. Keep both (and the README status table) in sync when phases advance or components change.
 
 ## Commands
 
@@ -34,65 +19,52 @@ PoC (mic → transcript, no LLM). Recording begins at launch — speak, press
 source .venv/bin/activate            # always work inside the venv
 
 python3 assistant.py                 # full pipeline: voice → LLM → tools
-python3 assistant.py --text "..."    # one-shot typed input — no mic/Whisper, for testing tool logic
-python3 listen.py                    # transcription only (Phase 1)
+python3 assistant.py --text "..."    # same pipeline, typed input — use this to test without mic/GPU-whisper
+python3 listen.py                    # Phase 1: transcription only
+python3 mic_check.py                 # diagnostic: live level meter for all input devices
 ```
 
-There is no test suite, linter config, or build step. `--text` is the fastest way
-to exercise the LLM/tool path without a microphone or GPU-loaded Whisper.
+There is no test suite, linter, or build step. Verification is manual: `--text` mode exercises the LLM + tool layer without audio; the smoke tests in INSTALL.md Step 6 verify GPU/Whisper, microphone, and Ollama independently. Ollama must be running (`localhost:11434`) with `qwen3:30b` pulled. On the current machine Ollama is a user-space tarball install with no systemd service — if `localhost:11434` doesn't answer, start it with `~/.local/bin/ollama serve &`.
 
-Environment setup (only when the venv is missing) is in `INSTALL.md`:
-system deps (`ffmpeg`, `portaudio19-dev`) → venv → `faster-whisper` +
-`nvidia-cublas-cu12 nvidia-cudnn-cu12` → `sounddevice numpy pynput ollama` →
-`ollama pull qwen3:8b`.
+Audio comes from the system **default** input source. If transcription returns "(nothing recognized)" while someone is speaking, suspect the default source before suspecting Whisper — `mic_check.py` shows which device actually hears the voice.
 
-## Architecture Notes
+## Architecture
 
-**cuDNN/cuBLAS preload.** `assistant.py` and `listen.py` both begin with a loop
-that `ctypes.CDLL`-loads every `.so` under the venv's `nvidia/*/lib` directories
-*before* importing `faster_whisper`. The pip-installed CUDA libs are not on the
-system loader path, so faster-whisper fails to init CUDA without this. Keep this
-block first in any new entry-point script.
+- **[listen.py](listen.py)** — Phase 1 PoC, standalone transcription loop. Recording starts on launch; Enter ends an utterance (this replaced the original hotkey design).
+- **[assistant.py](assistant.py)** — the main pipeline. Loads all tools, runs the record → transcribe → `ollama.chat` loop. Tool calls are executed in rounds (max `MAX_TOOL_ROUNDS`) until the LLM returns plain text. Tool exceptions are caught and returned to the LLM as `error: ...` strings — tool bugs must never kill the session.
+- **[tools/](tools/)** — plugin directory, auto-discovered at startup.
+- **[mic_check.py](mic_check.py)** — standalone diagnostic, not part of the pipeline.
 
-**Tool plugin contract.** `load_tools()` in `assistant.py` imports every
-`tools/*.py` (skipping `_`-prefixed files) and expects each module to export:
-- `TOOL` — an Ollama/OpenAI-style function schema (`{"type": "function", "function": {...}}`)
-- `run(**kwargs)` — the callable; its return value (stringified) is fed back to the LLM as the tool result
+### LLM output quirk
 
-`TOOL["function"]["name"]` is the registry key and must match the schema. To add
-a capability, drop a new file in `tools/` following this contract — no
-registration elsewhere. Tools return error strings (e.g. `"error: ..."`) rather
-than raising; `handle_utterance` also catches exceptions so a tool bug can't kill
-the session.
+`qwen3:30b` sometimes emits its chain-of-thought inline despite `think=False`; `handle_utterance` in assistant.py strips everything up to a leaked `</think>` tag before returning the reply. Keep that strip when changing models — it's a no-op for models that behave.
 
-**Execution model (the core safety design).** Predefined `tools/*.py` run freely.
-The one exception is `run_python`, which executes LLM-generated ad-hoc Python: it
-prints the code and requires an interactive `y` confirmation before running (in a
-subprocess, 30s timeout, cwd = workspace). This confirm-before-run split is a
-deliberate project principle — preserve it. Path-taking tools (`read_file`,
-`list_files`) guard against escaping the workspace root via realpath checks; keep
-that guard in any new file-touching tool.
+### Tool plugin convention
 
-**LLM loop.** `handle_utterance` runs up to `MAX_TOOL_ROUNDS` (5) chat rounds,
-appending each tool result and re-querying until the model stops calling tools or
-the cap is hit. `think=False` is set on `ollama.chat`. `messages` persists across
-utterances within a session (conversational memory).
+Every `tools/*.py` file (names starting with `_` are skipped) must expose exactly two module-level things:
 
-## Hardware / Migration
+- `TOOL` — an Ollama/OpenAI-style function schema dict (`{"type": "function", "function": {...}}`)
+- `run(**kwargs)` — the callable; parameters match the schema. Return a string (results and errors alike — return `"error: ..."`, don't raise).
 
-Written and verified on an **RTX 4080 Laptop (12 GB VRAM, Ada, CUDA 12 wheels)**.
-Model choices (`small.en` Whisper, `qwen3:8b`) and the `nvidia-*-cu12` packages
-are tied to this card. An **RTX 5090 (Blackwell, sm_120)** migration is planned
-and needs CUDA 12.8+ — see the *GPU compatibility* section at the top of
-`INSTALL.md` before switching cards, then scale models up (`large-v3`, 14–32B LLM)
-and re-run the Step 6 smoke tests.
+Conventions the existing tools follow, keep them for new ones:
 
-## Conventions
+- **Path safety:** any file access resolves via `os.path.realpath` and verifies the result stays inside the workspace root.
+- **Output caps:** truncate long output before returning it to the LLM (see `MAX_CHARS` / `MAX_OUTPUT`).
+- **Confirmation split:** predefined tools run freely; LLM-*generated* code goes through `run_python`, which prints the code and requires an explicit `y` before executing. Never weaken this confirmation path.
 
-- Constants live at the top of each script (`SAMPLE_RATE=16000`, `WHISPER_MODEL`,
-  `LLM_MODEL`, `MAX_TOOL_ROUNDS`). Change models there.
-- Whisper is pinned to `language="en"` with `vad_filter=True` for speed/accuracy.
-- `notes/`, `*.wav`, `error_logs.txt`, and `.venv/` are gitignored; `write_note`
-  writes into the ignored `notes/` folder.
-- Tools are written as clean, self-describing functions on purpose — a possible
-  future direction is exposing them as an MCP server (see `PROJECT.md`).
+### CUDA preload quirk
+
+`listen.py` and `assistant.py` begin by `ctypes.CDLL`-loading every `nvidia/*/lib/*.so*` from the venv's site-packages **before** importing faster-whisper — the pip-installed cuBLAS/cuDNN libs aren't on the system loader path. Any new entry point that uses Whisper on GPU needs the same preload block.
+
+### Camera / vision tool (`tools/see_camera.py` → `look`)
+
+Deliberately dependency-light so it stays "lightweight YOLO": **no OpenCV, no PyTorch, no ultralytics at runtime.** `models/yolov8n.onnx` (stock COCO, 80 classes) runs under `onnxruntime` on **CPU** (one snapshot is fast enough there — the GPU stays reserved for Whisper/LLM); NMS and box-decode are plain numpy in the tool. Detections come back as `name (conf, left|center|right[, distance m])`.
+
+- **Depth / distance:** the camera is an **Intel RealSense D455** (`8086:0b5c`). `_capture_realsense()` (pyrealsense2) grabs colour + depth *aligned to the colour lens* via `rs.align`, so distance is read straight from the depth map at each YOLO box centre (median of a small patch, ignoring zero/invalid pixels; depth scale ≈ 1 mm/unit). This is the whole reason detection runs on the colour node — depth and colour are two physically-offset lenses, and alignment is what makes "read depth at the box centre" correct.
+- **Fallback:** if pyrealsense2/the RealSense isn't usable, `_capture_ffmpeg()` grabs a plain colour frame instead — same detection, **no distance**. Node layout: `/dev/video0` is the `Z16` depth stream, the RGB node is `/dev/video4` (`YUYV`); `_detect_camera()` auto-picks the first colour node (`MJPG`/`YUYV`), skipping depth/IR. Override with `SEE_CAMERA_DEVICE=/dev/videoN`.
+- **Model:** `models/yolov8n.onnx` is git-ignored (not committed). It was produced once by exporting stock `yolov8n.pt` with `ultralytics` in a throwaway venv — the project venv never gets torch. To regenerate it, see the vision section in INSTALL.md.
+- Runs entirely on CPU, so — unlike the Whisper entry points — it needs **no** CUDA preload block.
+
+### GPU compatibility
+
+Package versions and model sizes (`large-v3`, `qwen3:30b`) are tied to the current RTX 5090 (32 GB VRAM, Blackwell/sm_120 — needs `ctranslate2 >= 4.6` for its CUDA 12.8 kernels). The "GPU compatibility" section at the top of INSTALL.md records the verified versions — consult it before touching CUDA packages or model choices.
