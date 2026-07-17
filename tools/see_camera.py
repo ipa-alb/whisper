@@ -17,7 +17,9 @@ Model: models/yolov8n.onnx (stock COCO, 80 classes).
 import glob
 import os
 import subprocess
+import sys
 import tempfile
+import time
 
 import numpy as np
 
@@ -125,7 +127,8 @@ def _capture_realsense():
 
     rgb = color_bgr[:, :, ::-1]                       # BGR → RGB
     depth_m = depth_raw.astype(np.float32) * scale    # units → metres
-    return _blob(_letterbox(rgb, 114)), _letterbox(depth_m, 0.0)
+    frame_lb = _letterbox(rgb, 114)
+    return _blob(frame_lb), _letterbox(depth_m, 0.0), frame_lb
 
 
 def _detect_camera():
@@ -166,7 +169,7 @@ def _capture_ffmpeg():
         err = proc.stderr.decode("utf-8", "replace").strip()[:300]
         raise RuntimeError(f"camera capture failed ({device}): {err or 'no frame'}")
     frame = np.frombuffer(proc.stdout, dtype=np.uint8).reshape(IMG_SIZE, IMG_SIZE, 3)
-    return _blob(frame), None
+    return _blob(frame), None, frame
 
 
 def _capture_g1():
@@ -201,12 +204,15 @@ def _capture_g1():
         data = np.load(local_npz)
         rgb, depth_m = data["color"], data["depth"]
 
-    return _blob(_letterbox(rgb, 114)), _letterbox(depth_m, 0.0)
+    frame_lb = _letterbox(rgb, 114)
+    return _blob(frame_lb), _letterbox(depth_m, 0.0), frame_lb
 
 
 def _capture():
     """Prefer RealSense (gives depth); fall back to ffmpeg colour-only.
 
+    Returns (blob, depth_lb_or_None, frame_lb) where frame_lb is the letterboxed
+    640x640 uint8 RGB the model saw — used to render the annotated look() frame.
     SEE_CAMERA_SOURCE=g1 captures from the G1 robot's Orin over ssh instead of a
     camera attached to this machine.
     """
@@ -255,7 +261,10 @@ def _sample_distance(depth_lb, cx, cy):
 
 
 def _postprocess(output, depth_lb):
-    """YOLOv8 (1,84,8400) → [(name, conf, orig_cx, distance_m_or_None)] by confidence."""
+    """YOLOv8 (1,84,8400) → [(name, conf, orig_cx, dist_m_or_None, box_lb)] by conf.
+
+    box_lb is [x1, y1, x2, y2] in letterboxed 640x640 space, so it draws directly
+    onto frame_lb from _capture()."""
     pred = np.squeeze(output).T          # (8400, 84)
     scores_all = pred[:, 4:]
     class_ids = scores_all.argmax(axis=1)
@@ -275,7 +284,8 @@ def _postprocess(output, depth_lb):
         for k in idx[keep]:
             orig_cx = (cx[k] - _PAD_X) / _GAIN          # back to the original frame
             dist = _sample_distance(depth_lb, cx[k], cy[k])
-            dets.append((COCO_NAMES[int(cid)], float(confs[k]), float(orig_cx), dist))
+            dets.append((COCO_NAMES[int(cid)], float(confs[k]), float(orig_cx), dist,
+                         boxes[k].tolist()))
     dets.sort(key=lambda d: d[1], reverse=True)
     return dets[:MAX_DETECTIONS]
 
@@ -305,22 +315,80 @@ def _get_session():
     return _session
 
 
+def _annotate(frame_lb, dets):
+    """Draw detection boxes + labels on the letterboxed RGB frame → a PIL.Image.
+
+    Pillow is imported here, not at module top, so the core detection path keeps
+    its no-OpenCV/no-Pillow footprint — the draw only loads when a caller has
+    opted into saving/showing the frame.
+    """
+    from PIL import Image, ImageDraw
+
+    im = Image.fromarray(np.ascontiguousarray(frame_lb).astype("uint8"), "RGB")
+    draw = ImageDraw.Draw(im)
+    for name, conf, _cx, dist, box in dets:
+        x1, y1, x2, y2 = (int(round(v)) for v in box)
+        draw.rectangle([x1, y1, x2, y2], outline=(0, 255, 0), width=2)
+        label = f"{name} {conf:.2f}" + (f" {dist:.1f}m" if dist is not None else "")
+        ty = y1 - 11 if y1 >= 11 else y1 + 1
+        draw.rectangle([x1, ty, x1 + 7 * len(label), ty + 11], fill=(0, 120, 0))
+        draw.text((x1 + 1, ty), label, fill=(255, 255, 255))
+    return im
+
+
+def _show_annotated(frame_lb, dets):
+    """Best-effort: save and/or flash the annotated look() frame. Never raises.
+
+    Enabled per-call via env (the robot `look` tool sets these; whisper's own
+    `look` leaves them unset, so its behaviour is unchanged):
+      SEE_CAMERA_SAVE_DIR   save a timestamped PNG here (paper archive)
+      SEE_CAMERA_POPUP=1    flash the frame in a borderless top-most window
+      SEE_CAMERA_POPUP_MS   how long to show it (default 1000 ms)
+      SEE_CAMERA_POPUP_X/Y  window top-left on screen (default 0,80 = left edge)
+      SEE_CAMERA_POPUP_SCALE enlarge/shrink factor for the popup (default 1.0)
+    """
+    save_dir = os.environ.get("SEE_CAMERA_SAVE_DIR")
+    popup = os.environ.get("SEE_CAMERA_POPUP") == "1"
+    if frame_lb is None or not (save_dir or popup):
+        return
+    try:
+        im = _annotate(frame_lb, dets)
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+            path = os.path.join(save_dir, time.strftime("look_%Y%m%d_%H%M%S.png"))
+        else:
+            path = os.path.join(tempfile.gettempdir(), "g1_look_latest.png")
+        im.save(path)
+        if popup:
+            helper = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_popup.py")
+            args = [sys.executable, helper, path,
+                    os.environ.get("SEE_CAMERA_POPUP_MS", "1000"),
+                    os.environ.get("SEE_CAMERA_POPUP_X", "0"),
+                    os.environ.get("SEE_CAMERA_POPUP_Y", "80"),
+                    os.environ.get("SEE_CAMERA_POPUP_SCALE", "1.0")]
+            subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass  # visualization is a demo aid; it must never break detection
+
+
 def run(target=None):
     if not os.path.isfile(MODEL_PATH):
         return "error: model not found at models/yolov8n.onnx (see INSTALL.md vision setup)"
 
     try:
         session = _get_session()
-        blob, depth_lb = _capture()
+        blob, depth_lb, frame_lb = _capture()
         output = session.run(None, {session.get_inputs()[0].name: blob})[0]
         dets = _postprocess(output, depth_lb)
     except Exception as e:  # keep tool errors as strings — never kill the session
         return f"error: {e}"
 
+    _show_annotated(frame_lb, dets)  # best-effort save/flash of the annotated frame
+
     if not dets:
         summary = "Camera snapshot: no recognizable objects detected."
     else:
-        parts = [_describe(*d) for d in dets]
+        parts = [_describe(*d[:4]) for d in dets]
         summary = f"Camera snapshot ({len(dets)} detected): " + ", ".join(parts) + "."
 
     if target:
