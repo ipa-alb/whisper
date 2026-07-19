@@ -17,6 +17,9 @@ snap.py), robot in walk mode.
   python3 align_and_calibrate.py              # full pipeline, one pass
   python3 align_and_calibrate.py --dry-run    # plan only, no motion, then stats
   python3 align_and_calibrate.py --no-start   # locomotion already enabled
+  python3 align_and_calibrate.py --square-only  # ONLY the orientation stage
+      (square-up + 90-deg lock from where the robot stands, ~1 m from the
+       marker; no approach walk, no table, no stats — just orientation output)
 """
 
 import argparse
@@ -44,6 +47,9 @@ def main():
                     help="skip locomotion enable (already in walk/loco mode)")
     ap.add_argument("--yes", action="store_true",
                     help="auto-confirm the walk-to-table gate (no prompt)")
+    ap.add_argument("--square-only", action="store_true",
+                    help="skip the approach: only square-up + 90-deg lock from "
+                         "the current position (robot already ~1 m from marker)")
     args = ap.parse_args()
 
     print("#" * 66)
@@ -64,18 +70,23 @@ def main():
     else:
         print("\n[1-2/4] dry-run: skipping link check / locomotion enable.")
 
-    print("\n[3/4] one-frame plan -> ~1 m -> frame -> gate -> table (self-calibrating) ...")
     store = am.load_store()
     store.pop("_flipped", None)          # reset per-run flip guard
-    ok = al.full_align(store, args.dry_run, assume_yes=args.yes)
+    if args.square_only:
+        print("\n[3/3] ORIENTATION ONLY: square-up + 90-deg lock (no approach) ...")
+        ok = al.square_onto_normal(store, args.dry_run) is not None
+    else:
+        print("\n[3/4] one-frame plan -> ~1 m -> frame -> gate -> table (self-calibrating) ...")
+        ok = al.full_align(store, args.dry_run, assume_yes=args.yes)
     if not args.dry_run:
         store.pop("_flipped", None)
         am.save_store(store)
         print(f"  calibration saved "
               f"({len(store['walk'])} walk, {len(store['turn'])} turn samples).")
 
-    print("\n[4/4] recalibrated stats:\n")
-    cs.print_stats(am.CALIB_PATH)
+    if not args.square_only:
+        print("\n[4/4] recalibrated stats:\n")
+        cs.print_stats(am.CALIB_PATH)
 
     print("\n  " + ("PIPELINE DONE." if ok else "PIPELINE ABORTED — see above."))
     sys.exit(0 if ok else 1)

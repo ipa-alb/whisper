@@ -60,7 +60,9 @@ TABLE_UNDERSHOOT = 1.0  # final leg lands ON target (0.9's short-bias can't reac
 APPROACH_UNDERSHOOT = 0.9  # size each go-there walk to land just short of its target
 TOPUP_TOL = 30.0      # cm; after a push, top-up again while still this far past target
 IPPE_AGREE = 5.0      # deg; def vs IPPE yaw must agree this close to trust yaw (readout only)
-YAW_SQUARE_TOL = 10.0  # deg; |yaw| within this = square enough (strafe can't do better)
+YAW_SQUARE_TOL = 3.5   # deg; the "90-deg lock" target (>= half the ~6.5 deg min step,
+                       # so a micro-turn below this could only make |yaw| worse)
+MAX_LOCK_ITERS = 3     # extra micro-turn+measure rounds after the square-up
 STRAFE_VY = 0.2       # calibrated lateral velocity tier (|vy|); VY_MAX is 0.3
 STRAFE_SPEED = 13.7   # cm/s sideways at |vy|=STRAFE_VY (fallback; refined from store)
 STRAFE_CAP = 120.0    # cm; clamp the open-loop sideways move (tan blows up near 45 deg)
@@ -186,14 +188,15 @@ def plan_and_go(store, target_fwd, label, dry, undershoot=APPROACH_UNDERSHOOT,
     print(f"  frame: fwd {p['fwd']:.0f} cm, x {p['x']:+.0f} cm, "
           f"range {rng:.0f} cm, bearing {p['bearing']:+.1f} deg")
 
-    # 1) turn in place to face the marker (null the bearing)
+    # 1) turn in place to face the marker (null the bearing) — one command,
+    #    duration extended for big bearings instead of chunking
     turn = am.plan_turn(store, p["bearing"])
     if turn is not None:
-        omega, deg = turn
-        print(f"  TURN omega={omega:+.2f} t={am.TURN_T}s  "
+        omega, t, deg = turn
+        print(f"  TURN omega={omega:+.2f} t={t:.1f}s  "
               f"(bearing {p['bearing']:+.1f}->0, ~{deg:.0f} deg)")
         if not dry:
-            g1.walk(0.0, 0.0, omega, am.TURN_T)
+            g1.walk(0.0, 0.0, omega, t)
     else:
         print(f"  bearing {p['bearing']:+.1f} within the turn floor — no turn.")
 
@@ -263,22 +266,25 @@ def confirm(prompt, dry, assume_yes):
 
 
 def _turn_by(store, signed_deg, dry):
-    """In-place turn by signed_deg (+ = right, omega<0). Split into ~1 s commands
-    each within the calibrated omega range, back-to-back with NO camera between."""
+    """In-place turn by signed_deg (+ = right, omega<0) as ONE command where
+    possible: omega up to the calibrated max, then the DURATION extends
+    (deg ~ k*omega*t, up to TURN_T_MAX) — no more 1 s chunking. Only rotations
+    beyond one maxed-out command (~115 deg) split, back-to-back, no camera."""
     if abs(signed_deg) < 3.0:
         return
     direction = "right" if signed_deg > 0 else "left"
     k = am.turn_k(store, direction)
-    per = k * am.TURN_OMEGA_MAX                 # most degrees one TURN_T can do
-    n = max(1, math.ceil(abs(signed_deg) / per))
-    omega_mag = min(am.TURN_OMEGA_MAX,
-                    max(am.TURN_OMEGA_MIN, abs(signed_deg) / n / k))
+    per_max = k * am.TURN_OMEGA_MAX * am.TURN_T_MAX / am.TURN_T  # one command's ceiling
+    n = max(1, math.ceil(abs(signed_deg) / per_max))
+    deg_each = abs(signed_deg) / n
+    omega_mag = min(am.TURN_OMEGA_MAX, max(am.TURN_OMEGA_MIN, deg_each / k))
+    t = max(am.TURN_T_MIN, min(am.TURN_T_MAX, deg_each / (k * omega_mag) * am.TURN_T))
     omega = -omega_mag if signed_deg > 0 else omega_mag
-    print(f"      TURN {signed_deg:+.0f} deg: {n}x omega={omega:+.2f} t={am.TURN_T}s")
+    print(f"      TURN {signed_deg:+.0f} deg: {n}x omega={omega:+.2f} t={t:.1f}s")
     if dry:
         return
     for _ in range(n):
-        g1.walk(0.0, 0.0, omega, am.TURN_T)
+        g1.walk(0.0, 0.0, omega, t)
 
 
 def _strafe_speed(store):
@@ -307,7 +313,7 @@ def _strafe_by(store, signed_cm, dry):
         remaining -= t
 
 
-def square_onto_normal(store, dry, yaw_tol=YAW_SQUARE_TOL):
+def square_onto_normal(store, dry, yaw_tol=YAW_SQUARE_TOL, pose=None):
     """Two-move square-up at the reading distance: from ONE measurement, ORIENT
     square to the marker face, then STRAFE sideways onto the table's normal. Both
     moves are computed up front and run back-to-back with NO detection in between
@@ -319,8 +325,13 @@ def square_onto_normal(store, dry, yaw_tol=YAW_SQUARE_TOL):
     turn by -sign*yaw to face square, then strafe (perpendicular to the new heading)
     by  x*cos(yaw) + sign*fwd*sin(yaw)  to land on the normal, centered. This slide
     is bounded (<= |x|+fwd), unlike a tan-based one. `sign` = YAW_NORMAL_SIGN
-    (+1: yaw>0 -> orient left, strafe right)."""
-    p = _measure_or_reacquire(dry, n=3)  # yaw is read here -> full median-of-3
+    (+1: yaw>0 -> orient left, strafe right).
+
+    `pose`: a just-taken measurement to plan from (e.g. the approach's arrival
+    frame) — skips this function's own initial measure, saving ~3 ssh snaps of
+    standing still right after the walk. Robot must not have moved since."""
+    p = pose if pose is not None else \
+        _measure_or_reacquire(dry, n=3)  # yaw is read here -> full median-of-3
     if p is None:
         print("  ABORT: lost the marker.")
         return None
@@ -348,8 +359,28 @@ def square_onto_normal(store, dry, yaw_tol=YAW_SQUARE_TOL):
     if q is None:
         print("  final measure: marker not seen (likely just off-frame after the strafe).")
         return p
+
+    # 90-DEG LOCK: iterate orient-only micro-turns (short-duration fine steps
+    # down to ~6.5 deg; below that a deliberate small overshoot past zero) until
+    # |yaw| <= yaw_tol or it stops improving. Strafe is NOT repeated — a
+    # micro-turn barely moves the bearing, and re-strafing couples noise back in.
+    for _ in range(MAX_LOCK_ITERS):
+        if not q["yaw_reliable"] or abs(q["yaw"]) <= yaw_tol:
+            break
+        prev = abs(q["yaw"])
+        print(f"  LOCK: yaw {q['yaw']:+.1f} deg -> micro-turn")
+        _turn_by(store, -YAW_NORMAL_SIGN * q["yaw"], dry)
+        if dry:
+            break
+        q2 = _measure_or_reacquire(dry, n=3)
+        if q2 is None:
+            break
+        q = q2
+        if abs(q["yaw"]) >= prev - 0.5:
+            break  # turn floor / measurement noise — accept what we have
+
     tag = "" if abs(q["yaw"]) <= yaw_tol else \
-        f"  (still {q['yaw']:+.0f} deg off-normal — re-run to refine)"
+        f"  (residual {q['yaw']:+.0f} deg — at the turn/noise floor)"
     print(f"  after square-up: fwd {q['fwd']:.0f} cm, bearing {q['bearing']:+.1f} deg, "
           f"yaw {q['yaw']:+.1f} deg.{tag}")
     return q
@@ -366,7 +397,7 @@ def full_align(store, dry, assume_yes=False):
     if p is None:
         return False
     print("\n-- SQUARE onto the table normal --")
-    p = square_onto_normal(store, dry)
+    p = square_onto_normal(store, dry, pose=p)  # reuse arrival frame: no re-measure
     if p is None:
         return False
     if not dry:

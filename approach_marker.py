@@ -59,7 +59,9 @@ STEP_CAP_CM = 60.0        # never plan a single walk longer than this
 BLIND_UNDERSHOOT = 0.9    # extra safety margin on the one blind creep
 DEFAULT_OFFSET = 30.0     # camera_fwd - toe distance; over-estimated => stops short
 ORIENT_TOL_DEG = 8.0      # bearing within this = squared enough (resolution floor)
-TURN_T = 1.0              # fixed turn duration (past the 0.75 s deadband)
+TURN_T = 1.0              # calibrated turn duration (past the 0.75 s deadband)
+TURN_T_MAX = 3.0          # single-command turn cap: extend duration, don't chunk
+TURN_T_MIN = 0.8          # shortest turn that still takes a step (deadband ~0.75 s)
 TURN_OMEGA_MIN, TURN_OMEGA_MAX = 0.15, 0.7
 MAX_ITERS = 12
 ARRIVE_TOL_CM = 6.0       # within this of a target = arrived (don't micro-step)
@@ -175,16 +177,33 @@ def turn_k(store, direction):
 
 
 def plan_turn(store, signed_deg):
-    """Return (omega_signed, achievable_deg) to rotate by signed_deg, or None if
-    below the ~8 deg resolution floor. bearing>0 needs a right turn (omega<0)."""
+    """Return (omega_signed, t, achievable_deg) to rotate by signed_deg, or None
+    if below the ~8 deg resolution floor. bearing>0 needs a right turn (omega<0).
+
+    Rotations beyond one calibrated second at omega_max extend the DURATION
+    (deg ~ k*omega*t, linear-in-t extrapolation of the t=1 s fit) up to
+    TURN_T_MAX -- ONE continuous command instead of several 1 s chunks.
+
+    Fine end: below omega_min at 1 s (~8 deg) the duration SHRINKS toward the
+    gait deadband (TURN_T_MIN), reaching ~6.5 deg. Even finer requests get the
+    minimal step anyway IF the deliberate overshoot past zero still shrinks
+    |error| (e.g. 4.9 deg -> 6.5 deg step -> land at -1.6); below half the
+    minimal step, None (nothing the platform does can improve it)."""
     direction = "right" if signed_deg > 0 else "left"
     k = turn_k(store, direction)
-    omega_mag = abs(signed_deg) / k
-    if omega_mag < TURN_OMEGA_MIN:
-        return None  # finer than the platform can do
-    omega_mag = min(omega_mag, TURN_OMEGA_MAX)
+    deg = abs(signed_deg)
+    omega_mag, t = deg / k, TURN_T
+    if omega_mag > TURN_OMEGA_MAX:
+        t = min(deg / (k * TURN_OMEGA_MAX) * TURN_T, TURN_T_MAX)
+        omega_mag = TURN_OMEGA_MAX
+    elif omega_mag < TURN_OMEGA_MIN:
+        min_step = k * TURN_OMEGA_MIN * TURN_T_MIN / TURN_T   # ~6.5 deg
+        if deg <= min_step / 2:
+            return None  # even the smallest step would leave a bigger |error|
+        omega_mag = TURN_OMEGA_MIN
+        t = max(deg / (k * TURN_OMEGA_MIN) * TURN_T, TURN_T_MIN)
     omega = -omega_mag if signed_deg > 0 else omega_mag  # +omega increases bearing
-    return omega, omega_mag * k
+    return omega, t, omega_mag * k * t / TURN_T
 
 
 # --- perception --------------------------------------------------------------
@@ -294,16 +313,17 @@ def phase_orient(store, dry):
         if plan is None:
             print("    residual below the ~8 deg turn floor -- accepting.")
             return True
-        omega, _ = plan
-        print(f"    turn omega={omega:+.2f} t={TURN_T}s")
+        omega, t, _ = plan
+        print(f"    turn omega={omega:+.2f} t={t:.1f}s")
         if dry:
             return True
-        g1.walk(0.0, 0.0, omega, TURN_T)
+        g1.walk(0.0, 0.0, omega, t)
         b2, _ = median_bearing()
         if b2 is not None:
             direction = "right" if omega < 0 else "left"
+            # non-1s samples are stored too; turn_k() filters to t~1 for its fit
             store["turn"].append({"dir": direction, "omega": round(abs(omega), 3),
-                                  "t": TURN_T, "deg": round(abs(b2 - bearing), 1)})
+                                  "t": round(t, 2), "deg": round(abs(b2 - bearing), 1)})
         prev_abs = abs(bearing)
     print("    reached iteration cap -- accepting current heading.")
     return True

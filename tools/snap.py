@@ -18,6 +18,7 @@ import math
 import os
 import subprocess
 import tempfile
+import time
 
 import cv2
 import numpy as np
@@ -144,6 +145,8 @@ def _capture_g1():
     remote_script = os.environ.get("G1_CAPTURE_SCRIPT", "/home/unitree/g1_capture_rgbd.py")
     remote_npz = "/tmp/g1_snap.npz"
 
+    t0 = time.time()
+    print("      [camera] snap (head cam over ssh)...", flush=True)
     grab = subprocess.run(
         ["ssh", orin, "python3", remote_script, remote_npz],
         capture_output=True, text=True, timeout=45,
@@ -171,6 +174,7 @@ def _capture_g1():
         dist_coeffs = data["dist_coeffs"].astype(np.float64)
 
     color_bgr = np.ascontiguousarray(rgb[:, :, ::-1])  # RGB → BGR for cv2 draw/imwrite
+    print(f"      [camera] done ({time.time() - t0:.1f}s)", flush=True)
     return color_bgr, depth_m, camera_matrix, dist_coeffs
 
 
