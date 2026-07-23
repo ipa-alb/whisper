@@ -7,3 +7,4 @@ notes/
 .vscode/
 # YOLO model weights are downloaded/exported locally, not committed (see INSTALL.md)
 models/*.onnx
+.venv_owl/

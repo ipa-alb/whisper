@@ -8,13 +8,30 @@ Lightweight, dependency-light vision. Two capture paths:
   2. Fallback: if no RealSense/depth camera is present, ffmpeg grabs a plain
      colour frame from a webcam — same detection, but no distance.
 
-Detection itself is stock yolov8n.onnx under onnxruntime (CPU); NMS and box
+Detection itself is a YOLOv8-family .onnx under onnxruntime (CPU); NMS and box
 decode are plain numpy. No PyTorch/OpenCV/ultralytics at runtime.
 
-Model: models/yolov8n.onnx (stock COCO, 80 classes).
+Model resolution (first hit wins):
+  1. SEE_CAMERA_MODEL env — path to any YOLOv8-style .onnx
+  2. models/yolov8s-world.onnx — YOLO-World v2-s exported with a fixed
+     vocabulary of the 80 COCO classes + workshop tools (hammer, mallet,
+     screwdriver, wrench, pliers); see INSTALL.md vision setup to regenerate
+  3. models/yolov8n.onnx — stock COCO fallback
+
+Class names come from a `<model>.names.json` sidecar (a plain JSON list in
+model output order) next to the .onnx; without one, stock COCO is assumed.
+
+Detector selection (SEE_CAMERA_DETECTOR = auto|owl|yolo, default auto):
+YOLO-World barely recognises workshop tools (a hanging mallet scores ~0.03),
+so when the `.venv_owl` interpreter exists, `auto` prefers OWLv2 — a
+text-prompted open-vocabulary detector run via tools/_owl_detect.py in its
+own venv (this venv stays torch-free). It detects whatever OWL_QUERIES
+name, including hammer/mallet/etc. On any OWLv2 failure the YOLO .onnx
+path runs as fallback.
 """
 
 import glob
+import json
 import os
 import subprocess
 import sys
@@ -24,7 +41,20 @@ import time
 import numpy as np
 
 WORKSPACE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MODEL_PATH = os.path.join(WORKSPACE, "models", "yolov8n.onnx")
+
+
+def _resolve_model():
+    override = os.environ.get("SEE_CAMERA_MODEL")
+    if override:
+        return override
+    for name in ("yolov8s-world.onnx", "yolov8n.onnx"):
+        path = os.path.join(WORKSPACE, "models", name)
+        if os.path.isfile(path):
+            return path
+    return os.path.join(WORKSPACE, "models", "yolov8n.onnx")
+
+
+MODEL_PATH = _resolve_model()
 
 IMG_SIZE = 640           # model input side
 CAP_W, CAP_H = 640, 480  # frame we ask the camera for
@@ -54,13 +84,43 @@ COCO_NAMES = [
     "toothbrush",
 ]
 
+
+def _load_names(model_path):
+    """Class names for the model: `<model>.names.json` sidecar, else COCO."""
+    sidecar = os.path.splitext(model_path)[0] + ".names.json"
+    try:
+        with open(sidecar) as f:
+            names = json.load(f)
+        if isinstance(names, list) and names:
+            return names
+    except (OSError, ValueError):
+        pass
+    return COCO_NAMES
+
+
+CLASS_NAMES = _load_names(MODEL_PATH)
+
+# --- OWLv2 (text-prompted detector, subprocess in its own venv) ---
+OWL_PY = os.environ.get(
+    "SEE_CAMERA_OWL_PY", os.path.join(WORKSPACE, ".venv_owl", "bin", "python")
+)
+OWL_HELPER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_owl_detect.py")
+OWL_THRESH = float(os.environ.get("SEE_CAMERA_OWL_THRESH", "0.2"))
+# What a general "what do you see" look asks OWLv2 for. Text-prompted models
+# only find what is named, so keep this list matched to the demo scene.
+OWL_QUERIES = [
+    "person", "hammer", "mallet", "screwdriver", "wrench", "pliers",
+    "bottle", "cup", "chair", "laptop", "cardboard box", "table",
+]
+
 TOOL = {
     "type": "function",
     "function": {
         "name": "look",
         "description": (
             "Take a single snapshot from the camera and report the objects detected "
-            "in it (people, bottles, laptops, chairs, etc. — 80 common object types), "
+            "in it (people, bottles, laptops, chairs, and workshop tools such as "
+            "hammers, mallets, screwdrivers and wrenches), "
             "including how far away each one is in metres when a depth camera is "
             "available. Use whenever the user asks what you can see, to look at the "
             "camera, whether a specific thing or person is in view, or how far away "
@@ -284,7 +344,7 @@ def _postprocess(output, depth_lb):
         for k in idx[keep]:
             orig_cx = (cx[k] - _PAD_X) / _GAIN          # back to the original frame
             dist = _sample_distance(depth_lb, cx[k], cy[k])
-            dets.append((COCO_NAMES[int(cid)], float(confs[k]), float(orig_cx), dist,
+            dets.append((CLASS_NAMES[int(cid)], float(confs[k]), float(orig_cx), dist,
                          boxes[k].tolist()))
     dets.sort(key=lambda d: d[1], reverse=True)
     return dets[:MAX_DETECTIONS]
@@ -313,6 +373,44 @@ def _get_session():
 
         _session = ort.InferenceSession(MODEL_PATH, providers=["CPUExecutionProvider"])
     return _session
+
+
+def _detect_owl(frame_lb, depth_lb, target=None):
+    """Run OWLv2 on the letterboxed frame via the .venv_owl subprocess.
+
+    Returns dets in the same shape as _postprocess:
+    [(name, conf, orig_cx, dist_m_or_None, box_lb)] sorted by confidence.
+    Raises on any failure so the caller can fall back to the YOLO path.
+    """
+    from PIL import Image
+
+    queries = list(OWL_QUERIES)
+    if target:
+        t = target.strip().lower()
+        if t and t not in queries:
+            queries.append(t)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        img_path = os.path.join(tmp, "frame.png")
+        Image.fromarray(np.ascontiguousarray(frame_lb).astype("uint8"), "RGB").save(img_path)
+        proc = subprocess.run(
+            [OWL_PY, OWL_HELPER, img_path, str(OWL_THRESH)] + queries,
+            capture_output=True, text=True, timeout=300,
+        )
+    if proc.returncode != 0:
+        raise RuntimeError(f"owl detector failed: {proc.stderr.strip()[:300]}")
+    raw = json.loads(proc.stdout.strip().splitlines()[-1])
+
+    dets = []
+    for d in raw:
+        x1, y1, x2, y2 = d["box"]
+        cx = (x1 + x2) / 2
+        orig_cx = (cx - _PAD_X) / _GAIN
+        dist = _sample_distance(depth_lb, cx, (y1 + y2) / 2)
+        dets.append((d["label"], float(d["conf"]), float(orig_cx), dist,
+                     [x1, y1, x2, y2]))
+    dets.sort(key=lambda d: d[1], reverse=True)
+    return dets[:MAX_DETECTIONS]
 
 
 def _annotate(frame_lb, dets):
@@ -372,14 +470,25 @@ def _show_annotated(frame_lb, dets):
 
 
 def run(target=None):
-    if not os.path.isfile(MODEL_PATH):
-        return "error: model not found at models/yolov8n.onnx (see INSTALL.md vision setup)"
+    detector = os.environ.get("SEE_CAMERA_DETECTOR", "auto")
+    use_owl = detector == "owl" or (detector == "auto" and os.path.isfile(OWL_PY))
+    if not use_owl and not os.path.isfile(MODEL_PATH):
+        return f"error: model not found at {MODEL_PATH} (see INSTALL.md vision setup)"
 
     try:
-        session = _get_session()
         blob, depth_lb, frame_lb = _capture()
-        output = session.run(None, {session.get_inputs()[0].name: blob})[0]
-        dets = _postprocess(output, depth_lb)
+        dets = None
+        if use_owl:
+            try:
+                dets = _detect_owl(frame_lb, depth_lb, target)
+            except Exception:
+                if detector == "owl":  # explicitly requested — surface the error
+                    raise
+                dets = None  # auto mode: fall through to YOLO
+        if dets is None:
+            session = _get_session()
+            output = session.run(None, {session.get_inputs()[0].name: blob})[0]
+            dets = _postprocess(output, depth_lb)
     except Exception as e:  # keep tool errors as strings — never kill the session
         return f"error: {e}"
 

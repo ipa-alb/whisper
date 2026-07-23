@@ -17,16 +17,24 @@ The two extra keys are what lets snap.py run ArUco solvePnP on a frame it never
 captured itself; they are additive, so see_camera._capture_g1 (which reads only
 color/depth) is unaffected.
 
-The RealSense on the G1's head is mounted UPSIDE-DOWN (rolled 180 deg about its
-optical axis) — raw frames come in with the ceiling at the bottom. We rotate
-colour and depth 180 deg here, together (they are aligned, so they must rotate
-as one), and move the intrinsics' principal point to match, so every consumer
-(snap.py's solvePnP left/right + yaw, see_camera's YOLO + left/right) works in an
-upright frame. Set ROTATE_180 = False if the camera is ever remounted upright.
+Two RealSense cameras exist on the robot, mounted differently, so whether a
+frame needs un-rotating depends on WHICH device we opened — decided by serial:
+
+  * D435i 327122073256 — integrated head camera, mounted upright: no rotation.
+  * belt-mounted D455  — rolled 180 deg about its optical axis: raw frames come
+    in with the ceiling at the bottom, so we rotate colour and depth 180 deg
+    together (they are aligned, so they must rotate as one) and move the
+    intrinsics' principal point to match.
+
+Any serial not in UPRIGHT_SERIALS is treated as rotated (the belt cam's serial
+is unknown until it is next plugged in — add it to a set once known). Overrides:
+  G1_CAM_SERIAL  open this specific device instead of the first one found
+  G1_CAM_ROTATE  force rotation on ("1") or off ("0") regardless of serial
 
 Usage (on the Orin):  python3 _g1_capture_rgbd.py /tmp/g1_snap.npz
 """
 
+import os
 import sys
 
 import numpy as np
@@ -34,15 +42,27 @@ import pyrealsense2 as rs
 
 CAP_W, CAP_H = 640, 480
 WARMUP = 10
-ROTATE_180 = True  # head camera is physically mounted upside-down
+UPRIGHT_SERIALS = {"327122073256"}  # integrated head D435i — mounted upright
+
+
+def _should_rotate(serial):
+    override = os.environ.get("G1_CAM_ROTATE")
+    if override in ("0", "1"):
+        return override == "1"
+    return serial not in UPRIGHT_SERIALS  # unknown serial => belt cam => rotated
 
 
 def main(out_path):
     pipe = rs.pipeline()
     cfg = rs.config()
+    want_serial = os.environ.get("G1_CAM_SERIAL")
+    if want_serial:
+        cfg.enable_device(want_serial)
     cfg.enable_stream(rs.stream.depth, CAP_W, CAP_H, rs.format.z16, 30)
     cfg.enable_stream(rs.stream.color, CAP_W, CAP_H, rs.format.bgr8, 30)
     profile = pipe.start(cfg)
+    serial = profile.get_device().get_info(rs.camera_info.serial_number)
+    rotate = _should_rotate(serial)
     try:
         scale = profile.get_device().first_depth_sensor().get_depth_scale()
         align = rs.align(rs.stream.color)  # warp depth into the colour frame
@@ -64,7 +84,7 @@ def main(out_path):
     rgb = color_bgr[:, :, ::-1]                     # BGR → RGB
     depth_m = depth_raw.astype(np.float32) * scale  # units → metres
     ppx, ppy = intr.ppx, intr.ppy
-    if ROTATE_180:
+    if rotate:
         # Un-rotate the upside-down sensor: reverse rows+cols of both aligned
         # frames, and reflect the principal point about the image centre so the
         # intrinsics stay valid ((W-1)-ppx, (H-1)-ppy).
@@ -85,8 +105,9 @@ def main(out_path):
         camera_matrix=camera_matrix,
         dist_coeffs=dist_coeffs,
     )
-    print(f"saved {out_path}: color{rgb.shape} depth{depth_m.shape} "
-          f"scale={scale:.6f} depth_median={float(np.median(depth_m[depth_m > 0])):.2f}m")
+    print(f"saved {out_path}: cam={serial} rotate={rotate} color{rgb.shape} "
+          f"depth{depth_m.shape} scale={scale:.6f} "
+          f"depth_median={float(np.median(depth_m[depth_m > 0])):.2f}m")
 
 
 if __name__ == "__main__":
