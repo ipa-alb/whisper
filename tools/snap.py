@@ -30,6 +30,13 @@ DETECTOR = cv2.aruco.ArucoDetector(ARUCO_DICT, ARUCO_PARAMS)
 
 MARKER_SIZE_M = 0.178  # measured physical marker size in meters
 
+# Belt-mounted D455 — the camera the marker approach uses (rolled 180°, so the
+# Orin grabber un-rotates it). With the head D435i also plugged into the Orin,
+# the grabber would otherwise open whichever device enumerates first, so we pin
+# this serial to guarantee the approach measures from the belt cam, not the head.
+# Override with G1_CAM_SERIAL (e.g. the head D435i 327122073256 for `look`).
+APPROACH_CAM_SERIAL = "146222254681"
+
 
 def print_marker_report(marker_id, x_m, y_m, dist_m, depth_m, yaw_deg):
     """Print a top-down map of where the marker sits relative to the camera.
@@ -144,15 +151,34 @@ def _capture_g1():
     orin = os.environ.get("G1_ORIN", "unitree@192.168.0.87")
     remote_script = os.environ.get("G1_CAPTURE_SCRIPT", "/home/unitree/g1_capture_rgbd.py")
     remote_npz = "/tmp/g1_snap.npz"
+    # Pin the head camera so a second RealSense (the belt D455) plugged into the
+    # Orin can't be opened by enumeration order. ssh joins these args into one
+    # remote shell command, so the env prefix applies to the grabber.
+    serial = os.environ.get("G1_CAM_SERIAL", APPROACH_CAM_SERIAL)
 
     t0 = time.time()
-    print("      [camera] snap (head cam over ssh)...", flush=True)
-    grab = subprocess.run(
-        ["ssh", orin, "python3", remote_script, remote_npz],
-        capture_output=True, text=True, timeout=45,
-    )
-    if grab.returncode != 0:
-        raise RuntimeError(f"orin capture failed: {(grab.stderr or grab.stdout).strip()[:300]}")
+    print("      [camera] snap (belt cam over ssh)...", flush=True)
+    # The D455 intermittently times out on wait_for_frames() right after the
+    # pipeline starts (RealSense "Frame didn't arrive"). A fresh grab almost
+    # always succeeds, so retry a few times rather than aborting the whole
+    # approach on one bad frame. Tune with G1_CAPTURE_RETRIES.
+    attempts = max(1, int(os.environ.get("G1_CAPTURE_RETRIES", "3")))
+    last_err = ""
+    for attempt in range(1, attempts + 1):
+        grab = subprocess.run(
+            ["ssh", orin, f"G1_CAM_SERIAL={serial}", "python3", remote_script, remote_npz],
+            capture_output=True, text=True, timeout=45,
+        )
+        if grab.returncode == 0:
+            break
+        last_err = (grab.stderr or grab.stdout).strip()[:300]
+        if attempt < attempts:
+            print(f"      [camera] grab {attempt}/{attempts} failed "
+                  f"({last_err.splitlines()[-1][:80] if last_err else '?'}), retrying...",
+                  flush=True)
+            time.sleep(1.0)
+    else:
+        raise RuntimeError(f"orin capture failed after {attempts} attempts: {last_err}")
 
     with tempfile.TemporaryDirectory() as tmp:
         local_npz = os.path.join(tmp, "snap.npz")

@@ -17,13 +17,15 @@ bearing points the robot straight at the marker -- i.e. at the table it sits on.
 Two-frame plan (NOT a measure->nudge->measure loop): from the FIRST frame we
 compute the whole approach -- turn to face the marker, then one continuous
 forward push (FAST tier for long pushes, with corrective top-ups) -- and walk it
-out in one go, landing ~1 m in front. Then a SQUARE-UP step does exactly TWO
-moves computed from one frame -- ORIENT square to the marker face, then STRAFE
-sideways onto the table's normal -- run back-to-back with NO detection in
-between (re-detecting mid-move kept losing the marker), judged by a single final
-frame. (A pure in-place turn can't square: off the normal it trades yaw for
-bearing 1:1, so it can only face OR be square, not both; strafe is the missing
-lateral move.) Finally, on confirmation, plan+walk straight in to the table.
+out in one go, landing ~1 m in front. Then a SQUARE-UP step makes TWO planned
+moves from one frame -- ORIENT square to the marker face, then a SINGLE STRAFE
+sideways onto the table's normal -- back-to-back with NO detection between them.
+The strafe runs ONCE (repeating it to trim a residual only bounced the robot
+L-R-L, since strafe scatters ~44% and can't resolve a few cm); a following
+YAW-ONLY lock then micro-turns the residual yaw square, leaving the small lateral
+offset the one strafe left. (A pure in-place turn can't square: off the normal it
+trades yaw for bearing 1:1, so it can only face OR be square, not both; strafe is
+the missing lateral move.) Finally, on confirmation, plan+walk straight to the table.
 Self-calibrating: appends command->effect to approach_calib.json.
 
 Runs on system python3 (needs cv2), robot in walk mode + `g1.py start`.
@@ -53,16 +55,23 @@ import approach_marker as am  # noqa: E402  reuse store + walk/turn models
 TARGET_FWD = 105.0    # cm; loose approach target (~1 m) — the "reading distance"
 # Final table standoff. TABLE_FWD is a camera-to-marker target; empirically
 # TABLE_FWD=60 with the 0.9 undershoot stopped the robot ~70 cm from the table, so
-# each -1 cm here is ~-1 cm at the table. TABLE_FWD=5 + no undershoot aims ~10 cm.
-# RAISE TABLE_FWD if the blind final push comes in too close / bumps the table.
-TABLE_FWD = 5.0
+# each -1 cm here is ~-1 cm at the table. TABLE_FWD=5 landed ~10 cm too close
+# (right at the table) on 2026-07-26. TABLE_FWD=15 was still "a bit too close", so
+# raised to 22, then to 27 (each +1 cm here is ~+1 cm at the table) for ~5 cm more
+# clearance from the hammer. RAISE further if still too close.
+TABLE_FWD = 27.0
 TABLE_UNDERSHOOT = 1.0  # final leg lands ON target (0.9's short-bias can't reach ~10 cm)
 APPROACH_UNDERSHOOT = 0.9  # size each go-there walk to land just short of its target
 TOPUP_TOL = 30.0      # cm; after a push, top-up again while still this far past target
 IPPE_AGREE = 5.0      # deg; def vs IPPE yaw must agree this close to trust yaw (readout only)
 YAW_SQUARE_TOL = 3.5   # deg; the "90-deg lock" target (>= half the ~6.5 deg min step,
                        # so a micro-turn below this could only make |yaw| worse)
-MAX_LOCK_ITERS = 3     # extra micro-turn+measure rounds after the square-up
+MAX_LOCK_ITERS = 4     # orient-only micro-turn+measure rounds after the single strafe
+STRAFE_FF_GAIN = 1.2  # bias the single planned strafe long: the strafe chronically
+                      # under-travels, so aim ~20% past the geometric target. There is
+                      # NO closed-loop re-strafe (it only bounced L-R-L around center),
+                      # so this one move has to be right — raise toward ~1.4 if the
+                      # marker still lands short of center.
 STRAFE_VY = 0.2       # calibrated lateral velocity tier (|vy|); VY_MAX is 0.3
 STRAFE_SPEED = 13.7   # cm/s sideways at |vy|=STRAFE_VY (fallback; refined from store)
 STRAFE_CAP = 120.0    # cm; clamp the open-loop sideways move (tan blows up near 45 deg)
@@ -288,29 +297,36 @@ def _turn_by(store, signed_deg, dry):
 
 
 def _strafe_speed(store):
-    """cm/s sideways at |vy|=STRAFE_VY, averaged over stored strafe samples."""
+    """cm/s sideways at |vy|=STRAFE_VY, the MEDIAN over stored strafe samples.
+    Median, not mean: the samples are bimodal with a fat high tail (a few 21-24 cm
+    slides), so the mean sits ~20% above the typical value -- an inflated speed
+    makes every planned strafe under-travel. The median tracks the common case, so
+    strafes reach the target instead of falling short."""
     sp = [abs(p["dx"]) / p["t"] for p in store.get("strafe", []) if p.get("t")]
-    return sum(sp) / len(sp) if sp else STRAFE_SPEED
+    return statistics.median(sp) if sp else STRAFE_SPEED
 
 
 def _strafe_by(store, signed_cm, dry):
     """Sideways shuffle by signed_cm (+ = robot's RIGHT), as back-to-back commands
-    with NO camera in between. Strafe is imprecise (~40% CoV) and yaw-coupled, so
-    this is one open-loop move judged only by the final measurement."""
+    with NO camera in between. Strafe is imprecise (~44% CoV) and yaw-coupled, so
+    the caller closes the loop (measure -> corrective strafe) instead of trusting
+    one open-loop move. Returns the total commanded duration (0.0 if below the
+    ~3 cm deadband), so a caller with clean before/after frames can log a sample."""
     if abs(signed_cm) < 3.0:
-        return
+        return 0.0
     left = signed_cm < 0
     vy = STRAFE_VY if left == STRAFE_LEFT_IS_POS_VY else -STRAFE_VY
     T_total = abs(signed_cm) / _strafe_speed(store)
     print(f"      STRAFE {'LEFT' if left else 'RIGHT'} {abs(signed_cm):.0f} cm "
           f"(vy={vy:+.2f}, T={T_total:.1f}s)")
     if dry:
-        return
+        return T_total
     remaining = T_total
     while remaining > 0.05:
         t = min(remaining, g1.WALK_MAX_DURATION)
         g1.walk(0.0, vy, 0.0, t)
         remaining -= t
+    return T_total
 
 
 def square_onto_normal(store, dry, yaw_tol=YAW_SQUARE_TOL, pose=None):
@@ -347,6 +363,7 @@ def square_onto_normal(store, dry, yaw_tol=YAW_SQUARE_TOL, pose=None):
     yr = math.radians(yaw)
     orient_deg = -YAW_NORMAL_SIGN * yaw                # 1) turn square to the marker face
     strafe_cm = x * math.cos(yr) + YAW_NORMAL_SIGN * fwd * math.sin(yr)  # 2) slide onto normal
+    strafe_cm *= STRAFE_FF_GAIN                        #    bias long (strafe under-travels)
     strafe_cm = max(-STRAFE_CAP, min(STRAFE_CAP, strafe_cm))            #    (perp to new heading)
     print(f"  off-normal yaw {yaw:+.1f} deg at {fwd:.0f} cm -> 2 moves "
           f"(no detect between): orient {orient_deg:+.0f} deg, then strafe {strafe_cm:+.0f} cm")
@@ -355,15 +372,17 @@ def square_onto_normal(store, dry, yaw_tol=YAW_SQUARE_TOL, pose=None):
     if dry:
         return p
 
-    q = _measure_or_reacquire(dry, n=3)  # final yaw readout
+    q = _measure_or_reacquire(dry, n=3)  # readout after the planned orient+strafe
     if q is None:
         print("  final measure: marker not seen (likely just off-frame after the strafe).")
         return p
 
-    # 90-DEG LOCK: iterate orient-only micro-turns (short-duration fine steps
-    # down to ~6.5 deg; below that a deliberate small overshoot past zero) until
-    # |yaw| <= yaw_tol or it stops improving. Strafe is NOT repeated — a
-    # micro-turn barely moves the bearing, and re-strafing couples noise back in.
+    # YAW-ONLY LOCK: the lateral move is done ONCE (the single planned strafe above).
+    # A fast strafe is right for that one big slide, but repeating it to trim a small
+    # residual only made the loop bounce L-R-L around center — strafe scatters ~44%
+    # and can't resolve a few cm, so a corrective strafe is as likely to overshoot as
+    # to help. So the clean-up is orient-only: micro-turn the residual yaw square,
+    # and accept whatever small lateral offset the single strafe left.
     for _ in range(MAX_LOCK_ITERS):
         if not q["yaw_reliable"] or abs(q["yaw"]) <= yaw_tol:
             break
@@ -381,8 +400,8 @@ def square_onto_normal(store, dry, yaw_tol=YAW_SQUARE_TOL, pose=None):
 
     tag = "" if abs(q["yaw"]) <= yaw_tol else \
         f"  (residual {q['yaw']:+.0f} deg — at the turn/noise floor)"
-    print(f"  after square-up: fwd {q['fwd']:.0f} cm, bearing {q['bearing']:+.1f} deg, "
-          f"yaw {q['yaw']:+.1f} deg.{tag}")
+    print(f"  after square-up: fwd {q['fwd']:.0f} cm, x {q['x']:+.0f} cm, "
+          f"bearing {q['bearing']:+.1f} deg, yaw {q['yaw']:+.1f} deg.{tag}")
     return q
 
 
