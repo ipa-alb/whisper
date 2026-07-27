@@ -145,6 +145,16 @@ TOOL = {
 # Lazily-initialised onnxruntime session (loading the model takes ~100ms).
 _session = None
 
+# Colour-lens intrinsics (3x3) from the most recent capture, cached so callers that
+# need a pixel->metre scale (e.g. grab_hammer's align) can read fx without a second
+# capture. Set by _capture_g1 from the Orin grabber's npz; None if unavailable.
+_LAST_CAMERA_MATRIX = None
+
+
+def last_camera_matrix():
+    """The most recent capture's 3x3 colour intrinsics [[fx,0,ppx],...], or None."""
+    return _LAST_CAMERA_MATRIX
+
 
 def _letterbox(img, fill):
     """Pad a CAP_H x CAP_W image into IMG_SIZE x IMG_SIZE (same geometry for RGB/depth)."""
@@ -246,12 +256,30 @@ def _capture_g1():
     remote_script = os.environ.get("G1_CAPTURE_SCRIPT", "/home/unitree/g1_capture_rgbd.py")
     remote_npz = "/tmp/g1_snap.npz"
 
-    grab = subprocess.run(
-        ["ssh", orin, "python3", remote_script, remote_npz],
-        capture_output=True, text=True, timeout=45,
-    )
-    if grab.returncode != 0:
-        raise RuntimeError(f"orin capture failed: {(grab.stderr or grab.stdout).strip()[:300]}")
+    # Optionally pin a specific RealSense on the Orin. Two are attached — the head
+    # D435i and the belt D455 — so without a serial the grabber opens whichever
+    # enumerates first. Mirror snap.py: forward G1_CAM_SERIAL so a caller (e.g.
+    # fetch.py) can force the belt cam. Unset = first-found (unchanged default).
+    serial = os.environ.get("G1_CAM_SERIAL")
+    cmd = ["ssh", orin]
+    if serial:
+        cmd.append(f"G1_CAM_SERIAL={serial}")
+    cmd += ["python3", remote_script, remote_npz]
+
+    # The belt D455 intermittently times out on wait_for_frames() right after the
+    # pipeline starts; a fresh grab almost always succeeds, so retry a couple of
+    # times rather than failing the whole look. Tune with G1_CAPTURE_RETRIES.
+    attempts = max(1, int(os.environ.get("G1_CAPTURE_RETRIES", "2")))
+    last_err = ""
+    for attempt in range(1, attempts + 1):
+        grab = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+        if grab.returncode == 0:
+            break
+        last_err = (grab.stderr or grab.stdout).strip()[:300]
+        if attempt < attempts:
+            time.sleep(1.0)
+    else:
+        raise RuntimeError(f"orin capture failed after {attempts} attempts: {last_err}")
 
     with tempfile.TemporaryDirectory() as tmp:
         local_npz = os.path.join(tmp, "snap.npz")
@@ -263,6 +291,8 @@ def _capture_g1():
             raise RuntimeError(f"scp of snapshot failed: {pull.stderr.strip()[:300]}")
         data = np.load(local_npz)
         rgb, depth_m = data["color"], data["depth"]
+        global _LAST_CAMERA_MATRIX
+        _LAST_CAMERA_MATRIX = data["camera_matrix"] if "camera_matrix" in data.files else None
 
     frame_lb = _letterbox(rgb, 114)
     return _blob(frame_lb), _letterbox(depth_m, 0.0), frame_lb
@@ -469,26 +499,42 @@ def _show_annotated(frame_lb, dets):
         pass  # visualization is a demo aid; it must never break detection
 
 
-def run(target=None):
+def detect(target=None):
+    """Capture one frame and return (dets, frame_lb) — the structured half of run().
+
+    dets is a list of (label, conf, cx_px, dist_m_or_None, box) tuples sorted by
+    confidence, exactly as _postprocess/_detect_owl produce them: cx_px is the
+    object's horizontal centre in ORIGINAL-frame pixels and dist_m its depth at the
+    box centre (None without a depth camera). Same capture + detector selection
+    run() uses; run() just formats these into its summary string. Callers that need
+    the numbers (e.g. the grab teach loop logging hammer x/depth) use this instead.
+
+    Raises on capture/model failure — the caller decides how to report it (run()
+    turns it into an 'error: ...' string)."""
     detector = os.environ.get("SEE_CAMERA_DETECTOR", "auto")
     use_owl = detector == "owl" or (detector == "auto" and os.path.isfile(OWL_PY))
     if not use_owl and not os.path.isfile(MODEL_PATH):
-        return f"error: model not found at {MODEL_PATH} (see INSTALL.md vision setup)"
+        raise RuntimeError(f"model not found at {MODEL_PATH} (see INSTALL.md vision setup)")
 
+    blob, depth_lb, frame_lb = _capture()
+    dets = None
+    if use_owl:
+        try:
+            dets = _detect_owl(frame_lb, depth_lb, target)
+        except Exception:
+            if detector == "owl":  # explicitly requested — surface the error
+                raise
+            dets = None  # auto mode: fall through to YOLO
+    if dets is None:
+        session = _get_session()
+        output = session.run(None, {session.get_inputs()[0].name: blob})[0]
+        dets = _postprocess(output, depth_lb)
+    return dets, frame_lb
+
+
+def run(target=None):
     try:
-        blob, depth_lb, frame_lb = _capture()
-        dets = None
-        if use_owl:
-            try:
-                dets = _detect_owl(frame_lb, depth_lb, target)
-            except Exception:
-                if detector == "owl":  # explicitly requested — surface the error
-                    raise
-                dets = None  # auto mode: fall through to YOLO
-        if dets is None:
-            session = _get_session()
-            output = session.run(None, {session.get_inputs()[0].name: blob})[0]
-            dets = _postprocess(output, depth_lb)
+        dets, frame_lb = detect(target)
     except Exception as e:  # keep tool errors as strings — never kill the session
         return f"error: {e}"
 
